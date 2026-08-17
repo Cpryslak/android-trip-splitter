@@ -6,6 +6,10 @@ covered; it works out the shortest list of payments that squares everyone up.
 Built for a Galaxy Tab S10 FE: large type, and a two-pane layout in landscape
 with the ledger beside the balances.
 
+- **Keeps every trip.** An *All trips* tab lists them newest first with totals
+  and how many payments are still outstanding. Starting a new one never disturbs
+  an old one, so you can reopen last year's to check who paid for the boat. New
+  trips carry over the same people, since the group usually is the same.
 - Works with no signal at all. Nothing leaves the tablet.
 - 3–12 people. Each expense can cover any subset of the group, so "dinner, but
   only four of us" is one tap.
@@ -13,7 +17,18 @@ with the ledger beside the balances.
   it, so correcting the rate later never rewrites what you already logged.
 - All arithmetic in whole cents. A 100.00 dinner for three splits 33.34 / 33.33 /
   33.33 — it never loses or invents a cent.
+- Records repayments. When someone actually hands over the money, **Mark paid**
+  on that settle-up line logs it, prefilled with the exact figure. Their balance
+  clears; everyone else's is untouched. Partial repayments work too — enter a
+  smaller amount and the remainder stays outstanding.
+- Repayments sit in the same ledger as expenses but are never split, and never
+  count as trip spending.
 - Sends the settle-up to the group chat as plain text.
+- **Backups.** *All trips* has *Send a backup*, which attaches every trip as a
+  .json file and sends it wherever you like — email, Drive, the group chat.
+  *Restore* reads one back and merges: trips in the file are added or overwritten,
+  and any trip not in the file is left alone, so restoring an old backup can't
+  cost you a newer trip.
 
 ---
 
@@ -75,3 +90,28 @@ suite runs on a plain JVM in seconds — including on GitHub before every build.
 - No receipt photos or barcode scanning.
 - No unequal weighting. An expense splits evenly among whoever it covered, which
   covers nearly every real case and keeps entry to a few taps.
+
+## Upgrading from an earlier build
+
+Storage moved from a single trip to a library of them. The old `trip.json` is
+read on first launch, becomes your first trip, and is left on disk untouched
+rather than deleted — if anything looks wrong, nothing has been destroyed.
+
+## What can and can't lose your data
+
+Every entry is written to the tablet the moment you save it, using a
+write-then-rename so a crash mid-write can't leave a damaged file. The app also
+keeps a copy of the last state that parsed cleanly on startup. So crashes,
+force-quits, and a flat battery cost you nothing beyond an entry you were still
+typing.
+
+Losing the tablet is the real risk, and only an off-device copy helps. Send
+yourself a backup at the start and after any big day of spending.
+
+## One rule about names
+
+Everyone needs a distinct name. The app keys all money to hidden ids, so
+renaming somebody mid-trip is safe and leaves their expenses attached — but two
+people called Chris are two separate balances that *print* identically, and the
+settle-up would read "Chris pays Chris". Setup refuses to save a roster with a
+repeated name for that reason.
