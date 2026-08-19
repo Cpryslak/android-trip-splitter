@@ -3,10 +3,16 @@ package com.tripsplit.app
 data class Balance(
     val personId: String,
     val paidMinor: Long,
-    val shareMinor: Long
+    val shareMinor: Long,
+    val sentMinor: Long = 0L,
+    val receivedMinor: Long = 0L
 ) {
-    /** Positive means the group owes them. */
-    val netMinor: Long get() = paidMinor - shareMinor
+    /**
+     * Positive means the group still owes them. Covering costs and handing
+     * someone cash both move you the same direction; being handed cash moves
+     * you back.
+     */
+    val netMinor: Long get() = paidMinor - shareMinor + sentMinor - receivedMinor
 }
 
 data class Transfer(
@@ -37,20 +43,35 @@ object Settle {
     fun balances(trip: Trip): List<Balance> {
         val paid = HashMap<String, Long>()
         val owed = HashMap<String, Long>()
+        val sent = HashMap<String, Long>()
+        val received = HashMap<String, Long>()
+
         for (e in trip.expenses) {
             paid[e.payerId] = (paid[e.payerId] ?: 0L) + e.homeMinor
             for ((id, share) in shares(e.homeMinor, e.sharedBy)) {
                 owed[id] = (owed[id] ?: 0L) + share
             }
         }
+        for (p in trip.payments) {
+            if (p.fromId == p.toId) continue // nonsense, and would cancel itself anyway
+            sent[p.fromId] = (sent[p.fromId] ?: 0L) + p.homeMinor
+            received[p.toId] = (received[p.toId] ?: 0L) + p.homeMinor
+        }
+
         return trip.people.map { p ->
-            Balance(p.id, paid[p.id] ?: 0L, owed[p.id] ?: 0L)
+            Balance(
+                personId = p.id,
+                paidMinor = paid[p.id] ?: 0L,
+                shareMinor = owed[p.id] ?: 0L,
+                sentMinor = sent[p.id] ?: 0L,
+                receivedMinor = received[p.id] ?: 0L
+            )
         }
     }
 
     /**
-     * Fewest payments that clear the board: the largest debtor pays the largest
-     * creditor, repeat. Never more than (people - 1) transfers.
+     * Fewest payments that clear what's left: the largest debtor pays the
+     * largest creditor, repeat. Never more than (people - 1) transfers.
      */
     fun transfers(balances: List<Balance>): List<Transfer> {
         val creditors = balances.filter { it.netMinor > 0 }
@@ -68,7 +89,12 @@ object Settle {
         var c = 0
         while (d < debt.size && c < credit.size) {
             val amount = minOf(debt[d], credit[c])
-            if (amount > 0L) out.add(Transfer(debtIds[d], creditIds[c], amount))
+            // A person can only be a debtor or a creditor, never both, so this
+            // should be unreachable. Guarded anyway: telling someone to pay
+            // themselves is worse than showing one fewer line.
+            if (amount > 0L && debtIds[d] != creditIds[c]) {
+                out.add(Transfer(debtIds[d], creditIds[c], amount))
+            }
             debt[d] -= amount
             credit[c] -= amount
             if (debt[d] == 0L) d++
@@ -82,16 +108,24 @@ object Settle {
         val sb = StringBuilder()
         val title = if (trip.name.isBlank()) "Trip" else trip.name
         sb.append(title).append("\n")
-        sb.append("Total spent: ").append(Money.withCode(trip.totalMinor, trip.homeCurrency))
-        sb.append("\n\n")
+        sb.append("Total spent: ").append(Money.withCode(trip.totalMinor, trip.homeCurrency)).append("\n")
+        if (trip.settledMinor > 0L) {
+            sb.append("Already settled: ")
+                .append(Money.withCode(trip.settledMinor, trip.homeCurrency)).append("\n")
+        }
+        sb.append("\n")
+
         for (b in balances(trip)) {
             sb.append(trip.nameOf(b.personId))
                 .append(" — paid ").append(Money.format(b.paidMinor))
                 .append(", share ").append(Money.format(b.shareMinor))
-                .append("\n")
+            if (b.sentMinor > 0L) sb.append(", repaid ").append(Money.format(b.sentMinor))
+            if (b.receivedMinor > 0L) sb.append(", received ").append(Money.format(b.receivedMinor))
+            sb.append("\n")
         }
+
         val moves = transfers(balances(trip))
-        sb.append("\nSettle up:\n")
+        sb.append("\nStill to settle:\n")
         if (moves.isEmpty()) {
             sb.append("Nothing owed. Everyone is square.\n")
         } else {
