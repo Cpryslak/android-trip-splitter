@@ -1,7 +1,5 @@
 package com.tripsplit.app
 
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -17,11 +15,14 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.DatePicker
+import androidx.compose.material3.DatePickerDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
@@ -31,38 +32,224 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.rememberDatePickerState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.listSaver
+import androidx.compose.runtime.saveable.mapSaver
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshots.SnapshotStateList
+import androidx.compose.runtime.snapshots.SnapshotStateMap
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import java.util.UUID
 
 private fun newId(): String = UUID.randomUUID().toString().take(8)
 
+/* ------------------------------------------------------------- savers
+ * Every field on these forms survives rotation and the app being killed in the
+ * background while someone checks a receipt in another app. Lists and maps need
+ * a hand to get into a Bundle. */
+
+private val StringListSaver = listSaver<SnapshotStateList<String>, String>(
+    save = { it.toList() },
+    restore = { saved -> mutableStateListOf<String>().apply { addAll(saved) } }
+)
+
+private val StringMapSaver = mapSaver(
+    save = { map: SnapshotStateMap<String, String> -> map.toMap() },
+    restore = { saved ->
+        mutableStateMapOf<String, String>().apply {
+            saved.forEach { (k, v) -> if (v is String) put(k, v) }
+        }
+    }
+)
+
+/** id, name, id, name … */
+private val PeopleSaver = listSaver<SnapshotStateList<Pair<String, String>>, String>(
+    save = { list -> list.flatMap { listOf(it.first, it.second) } },
+    restore = { flat ->
+        mutableStateListOf<Pair<String, String>>().apply {
+            var i = 0
+            while (i + 1 < flat.size) {
+                add(flat[i] to flat[i + 1])
+                i += 2
+            }
+        }
+    }
+)
+
+/* ------------------------------------------------------------- shared pieces */
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun SectionLabel(text: String) {
-    Text(
-        text = text.uppercase(),
-        style = MaterialTheme.typography.labelMedium,
-        color = MoneySlate
+private fun FormTopBar(
+    title: String,
+    onBack: (() -> Unit)?,
+    closeIcon: Boolean = false,
+    onDelete: (() -> Unit)? = null
+) {
+    TopAppBar(
+        colors = TopAppBarDefaults.topAppBarColors(
+            containerColor = MaterialTheme.colorScheme.background,
+            titleContentColor = MaterialTheme.colorScheme.onBackground
+        ),
+        title = { Text(title) },
+        navigationIcon = {
+            if (onBack != null) {
+                IconButton(onClick = onBack) {
+                    if (closeIcon) Icon(Icons.Default.Close, contentDescription = "Cancel")
+                    else Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                }
+            }
+        },
+        actions = {
+            if (onDelete != null) {
+                IconButton(onClick = onDelete) {
+                    Icon(Icons.Default.Delete, contentDescription = "Delete")
+                }
+            }
+        }
     )
-    Spacer(Modifier.height(8.dp))
+}
+
+/** Which currency an amount is being typed in, when the trip has two. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun CurrencyToggle(trip: Trip, inLocal: Boolean, onChange: (Boolean) -> Unit) {
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        FilterChip(
+            selected = !inLocal,
+            onClick = { onChange(false) },
+            label = { Text(trip.homeCurrency) }
+        )
+        FilterChip(
+            selected = inLocal,
+            onClick = { onChange(true) },
+            label = { Text(trip.localCurrency) }
+        )
+    }
+}
+
+/**
+ * The conversion line under a local-currency amount. An entry being edited keeps
+ * the rate it was recorded at, so fixing a typo in the note never rewrites the
+ * home amount; moving it to today's rate is a deliberate tap, and reversible.
+ */
+@Composable
+private fun RateLine(
+    trip: Trip,
+    homeMinor: Long?,
+    rateInUse: Double,
+    originalRate: Double?,
+    onUseRate: (Double) -> Unit
+) {
+    Spacer(Modifier.height(10.dp))
+    if (homeMinor != null) {
+        Text(
+            "= " + Money.withCode(homeMinor, trip.homeCurrency) + " at " + Money.formatRate(rateInUse),
+            style = MaterialTheme.typography.bodyLarge,
+            color = MoneyGold
+        )
+    }
+    when {
+        rateInUse != trip.rate -> {
+            Text(
+                "That's the rate this was entered at. The trip's rate is now " +
+                    Money.formatRate(trip.rate) + ".",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MoneySlate
+            )
+            TextButton(onClick = { onUseRate(trip.rate) }) { Text("Use today's rate instead") }
+        }
+        originalRate != null && originalRate != trip.rate -> {
+            Text(
+                "Using today's rate. It was entered at " + Money.formatRate(originalRate) + ".",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MoneySlate
+            )
+            TextButton(onClick = { onUseRate(originalRate) }) { Text("Keep the original rate") }
+        }
+    }
+}
+
+/** The day an entry belongs to, with a picker for backdating last night's dinner. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun DateRow(createdAt: Long, onChange: (Long) -> Unit) {
+    var open by rememberSaveable { mutableStateOf(false) }
+    val day = Dates.dayOf(createdAt)
+    val label = Dates.dayLabel(day).let {
+        if (it == "Today" || it == "Yesterday") it + " · " + Dates.shortDate(createdAt) else it
+    }
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+        TextButton(onClick = { open = true }) { Text("Change date") }
+    }
+    if (open) {
+        val state = rememberDatePickerState(
+            initialSelectedDateMillis = Dates.utcMillisOf(day)
+        )
+        DatePickerDialog(
+            onDismissRequest = { open = false },
+            confirmButton = {
+                TextButton(onClick = {
+                    state.selectedDateMillis?.let { picked ->
+                        onChange(Dates.onDay(createdAt, Dates.dayFromUtcMillis(picked)))
+                    }
+                    open = false
+                }) { Text("OK") }
+            },
+            dismissButton = {
+                TextButton(onClick = { open = false }) { Text("Cancel") }
+            }
+        ) {
+            DatePicker(state = state)
+        }
+    }
+}
+
+/** Chips for people, each carrying their colour so the ledger reads the same way. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun PersonChips(
+    trip: Trip,
+    isSelected: (String) -> Boolean,
+    onClick: (String) -> Unit
+) {
+    FlowRow(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        trip.people.forEach { p ->
+            FilterChip(
+                selected = isSelected(p.id),
+                onClick = { onClick(p.id) },
+                label = { Text(p.name) },
+                leadingIcon = { ColorDot(personColor(trip, p.id)) }
+            )
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ setup */
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SetupScreen(
     trip: Trip,
@@ -71,14 +258,14 @@ fun SetupScreen(
     onCancel: (() -> Unit)?,
     onDeleteTrip: ((String) -> Unit)?
 ) {
-    var confirmDeleteTrip by remember { mutableStateOf(false) }
-    var name by remember { mutableStateOf(trip.name) }
-    var home by remember { mutableStateOf(trip.homeCurrency) }
-    var local by remember { mutableStateOf(trip.localCurrency) }
-    var rateText by remember {
-        mutableStateOf(if (trip.rate == 1.0) "" else trip.rate.toString())
+    var confirmDeleteTrip by rememberSaveable { mutableStateOf(false) }
+    var name by rememberSaveable { mutableStateOf(trip.name) }
+    var home by rememberSaveable { mutableStateOf(trip.homeCurrency) }
+    var local by rememberSaveable { mutableStateOf(trip.localCurrency) }
+    var rateText by rememberSaveable {
+        mutableStateOf(if (trip.rate == 1.0) "" else Money.formatRate(trip.rate))
     }
-    val people = remember {
+    val people = rememberSaveable(saver = PeopleSaver) {
         mutableStateListOf<Pair<String, String>>().also { list ->
             trip.people.forEach { list.add(it.id to it.name) }
             while (list.size < 4) list.add(newId() to "")
@@ -95,22 +282,13 @@ fun SetupScreen(
     val canSave = named.size >= 2 && duplicateNames.isEmpty()
 
     Scaffold(
+        snackbarHost = { SnackbarHost(LocalSnackbar.current) },
         topBar = {
-            TopAppBar(
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.background,
-                    titleContentColor = MaterialTheme.colorScheme.onBackground
-                ),
-                title = { Text(if (firstRun) "New trip" else "Trip settings") },
-                // A cancellable first run means it's an extra trip, not the very
-                // first, so the button below says Start rather than anything final.
-                navigationIcon = {
-                    if (onCancel != null) {
-                        IconButton(onClick = onCancel) {
-                            Icon(Icons.Default.Close, contentDescription = "Cancel")
-                        }
-                    }
-                }
+            // The very first run has nowhere to go back to, so no button at all.
+            FormTopBar(
+                title = if (firstRun) "New trip" else "Trip settings",
+                onBack = onCancel,
+                closeIcon = firstRun
             )
         }
     ) { inner ->
@@ -152,6 +330,8 @@ fun SetupScreen(
                 ) {
                     val isDuplicate = entry.second.isNotBlank() &&
                         duplicateNames.contains(entry.second.trim().lowercase())
+                    ColorDot(personColorAt(i), 14.dp)
+                    Spacer(Modifier.width(10.dp))
                     OutlinedTextField(
                         value = entry.second,
                         onValueChange = { people[i] = entry.first to it },
@@ -219,17 +399,16 @@ fun SetupScreen(
                 )
             }
 
-
             Spacer(Modifier.height(32.dp))
             Button(
                 onClick = {
-                    val rate = rateText.replace(",", ".").toDoubleOrNull() ?: 1.0
+                    val rate = Money.parseRate(rateText) ?: 1.0
                     onSave(
                         trip.copy(
                             name = name.trim(),
                             homeCurrency = if (home.isBlank()) "USD" else home.trim(),
                             localCurrency = local.trim(),
-                            rate = if (rate > 0.0) rate else 1.0,
+                            rate = rate,
                             people = named.map { Person(it.first, it.second.trim()) },
                             started = true
                         )
@@ -285,9 +464,8 @@ fun SetupScreen(
             text = {
                 Text(
                     (if (trip.name.isBlank()) "This trip" else trip.name) +
-                        " and everything logged against it will be gone. If you've sent " +
-                        "yourself a backup you can restore it later; otherwise this " +
-                        "can't be undone."
+                        " and everything logged against it will be removed. You'll get " +
+                        "a few seconds to undo, and a backup can always bring it back."
                 )
             },
             confirmButton = {
@@ -305,7 +483,9 @@ fun SetupScreen(
 
 /* --------------------------------------------------------------- expenses */
 
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+private enum class SplitMode { Equal, Shares, Exact }
+
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun EditExpenseScreen(
     trip: Trip,
@@ -314,70 +494,103 @@ fun EditExpenseScreen(
     onDelete: (String) -> Unit,
     onCancel: () -> Unit
 ) {
-    var amountText by remember {
-        mutableStateOf(
-            when {
-                existing == null -> ""
-                existing.localMinor != null -> Money.format(existing.localMinor)
-                else -> Money.format(existing.homeMinor)
-            }
-        )
+    // What was typed originally, in the currency it was typed in — unless the
+    // trip has since lost its second currency, in which case the home figure.
+    val typedOriginally: Long? = existing?.let {
+        if (it.localMinor != null && trip.hasLocalCurrency) it.localMinor else it.homeMinor
     }
-    var inLocal by remember { mutableStateOf(existing?.localMinor != null) }
-    var note by remember { mutableStateOf(existing?.note ?: "") }
-    var payerId by remember { mutableStateOf(existing?.payerId ?: trip.people.firstOrNull()?.id ?: "") }
-    val sharedBy = remember {
+    var amountText by rememberSaveable {
+        mutableStateOf(typedOriginally?.let { Money.format(it) } ?: "")
+    }
+    var inLocal by rememberSaveable {
+        mutableStateOf(existing?.localMinor != null && trip.hasLocalCurrency)
+    }
+    var rateInUse by rememberSaveable { mutableStateOf(existing?.rateUsed ?: trip.rate) }
+    var note by rememberSaveable { mutableStateOf(existing?.note ?: "") }
+    var category by rememberSaveable { mutableStateOf(existing?.category ?: "") }
+    var payerId by rememberSaveable {
+        mutableStateOf(existing?.payerId ?: trip.people.firstOrNull()?.id ?: "")
+    }
+    var createdAt by rememberSaveable {
+        mutableStateOf(existing?.createdAt?.takeIf { it > 0L } ?: System.currentTimeMillis())
+    }
+    val sharedBy = rememberSaveable(saver = StringListSaver) {
         mutableStateListOf<String>().also { list ->
             if (existing != null) list.addAll(existing.sharedBy)
             else trip.people.forEach { list.add(it.id) }
         }
     }
-    var confirmDelete by remember { mutableStateOf(false) }
+
+    // Weights that add up to the typed total are exact amounts; anything else
+    // uneven is shares. Equal weights are just an equal split.
+    val initialWeights: Map<String, Long>? = existing?.weights
+    val initialMode = when {
+        existing == null || initialWeights == null || !existing.isUneven -> SplitMode.Equal
+        typedOriginally != null && initialWeights.values.sum() == typedOriginally -> SplitMode.Exact
+        else -> SplitMode.Shares
+    }
+    var mode by rememberSaveable { mutableStateOf(initialMode) }
+    val sharesText = rememberSaveable(saver = StringMapSaver) {
+        mutableStateMapOf<String, String>().also { m ->
+            if (initialMode == SplitMode.Shares) {
+                initialWeights?.forEach { (id, w) -> m[id] = w.toString() }
+            }
+        }
+    }
+    val exactText = rememberSaveable(saver = StringMapSaver) {
+        mutableStateMapOf<String, String>().also { m ->
+            if (initialMode == SplitMode.Exact) {
+                initialWeights?.forEach { (id, w) -> m[id] = Money.format(w) }
+            }
+        }
+    }
 
     val typedMinor = Money.parse(amountText)
+    val usingLocal = inLocal && trip.hasLocalCurrency
     val homeMinor = when {
         typedMinor == null -> null
-        inLocal && trip.hasLocalCurrency -> Money.convert(typedMinor, trip.rate)
+        usingLocal -> Money.convert(typedMinor, rateInUse)
         else -> typedMinor
     }
-    val valid = homeMinor != null && homeMinor > 0L && payerId.isNotBlank() && sharedBy.isNotEmpty()
+    val typedCode = if (usingLocal) trip.localCurrency else trip.homeCurrency
 
-    if (confirmDelete && existing != null) {
-        AlertDialog(
-            onDismissRequest = { confirmDelete = false },
-            title = { Text("Delete this expense?") },
-            text = { Text("It'll come straight out of everyone's balances.") },
-            confirmButton = {
-                TextButton(onClick = { confirmDelete = false; onDelete(existing.id) }) {
-                    Text("Delete")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { confirmDelete = false }) { Text("Keep it") }
-            }
-        )
+    // Participants in the order people are listed, so the rows below never jump.
+    val participants = trip.people.map { it.id }.filter { sharedBy.contains(it) }
+    val weights: Map<String, Long>? = when (mode) {
+        SplitMode.Equal -> null
+        SplitMode.Shares -> participants.associateWith {
+            (sharesText[it]?.toLongOrNull() ?: 1L).coerceAtLeast(0L)
+        }
+        SplitMode.Exact -> participants.associateWith { Money.parse(exactText[it] ?: "") ?: 0L }
+    }
+    // Someone given nothing isn't sharing it; drop them so "split 3 ways" stays true.
+    val savedParticipants = if (weights == null) participants
+    else participants.filter { (weights[it] ?: 0L) > 0L }
+    val savedWeights = weights?.filterKeys { savedParticipants.contains(it) }
+    val assigned = weights?.values?.sum() ?: 0L
+    val splitOk = when (mode) {
+        SplitMode.Equal -> true
+        SplitMode.Shares -> assigned > 0L
+        SplitMode.Exact -> typedMinor != null && assigned == typedMinor
+    }
+    val valid = homeMinor != null && homeMinor > 0L && payerId.isNotBlank() &&
+        savedParticipants.isNotEmpty() && splitOk
+    val preview: Map<String, Long>? =
+        if (homeMinor != null && savedParticipants.isNotEmpty() && splitOk)
+            Settle.shares(homeMinor, savedParticipants, savedWeights) else null
+
+    val amountFocus = remember { FocusRequester() }
+    LaunchedEffect(Unit) {
+        if (existing == null) amountFocus.requestFocus()
     }
 
     Scaffold(
+        snackbarHost = { SnackbarHost(LocalSnackbar.current) },
         topBar = {
-            TopAppBar(
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.background,
-                    titleContentColor = MaterialTheme.colorScheme.onBackground
-                ),
-                title = { Text(if (existing == null) "New expense" else "Edit expense") },
-                navigationIcon = {
-                    IconButton(onClick = onCancel) {
-                        Icon(Icons.Default.Close, contentDescription = "Cancel")
-                    }
-                },
-                actions = {
-                    if (existing != null) {
-                        IconButton(onClick = { confirmDelete = true }) {
-                            Icon(Icons.Default.Delete, contentDescription = "Delete")
-                        }
-                    }
-                }
+            FormTopBar(
+                title = if (existing == null) "New expense" else "Edit expense",
+                onBack = onCancel,
+                onDelete = if (existing != null) ({ onDelete(existing.id) }) else null
             )
         }
     ) { inner ->
@@ -395,30 +608,19 @@ fun EditExpenseScreen(
                 label = { Text("Amount") },
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth().focusRequester(amountFocus)
             )
 
             if (trip.hasLocalCurrency) {
                 Spacer(Modifier.height(12.dp))
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(
-                        selected = !inLocal,
-                        onClick = { inLocal = false },
-                        label = { Text(trip.homeCurrency) }
-                    )
-                    FilterChip(
-                        selected = inLocal,
-                        onClick = { inLocal = true },
-                        label = { Text(trip.localCurrency) }
-                    )
-                }
-                if (inLocal && homeMinor != null) {
-                    Spacer(Modifier.height(10.dp))
-                    Text(
-                        "= " + Money.withCode(homeMinor, trip.homeCurrency) +
-                            " at " + trip.rate,
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = MoneyGold
+                CurrencyToggle(trip, inLocal) { inLocal = it }
+                if (usingLocal) {
+                    RateLine(
+                        trip = trip,
+                        homeMinor = homeMinor,
+                        rateInUse = rateInUse,
+                        originalRate = existing?.rateUsed,
+                        onUseRate = { rateInUse = it }
                     )
                 }
             }
@@ -431,33 +633,36 @@ fun EditExpenseScreen(
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth()
             )
-
-            Spacer(Modifier.height(28.dp))
-            SectionLabel("Paid by")
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                trip.people.forEach { p ->
+            Spacer(Modifier.height(10.dp))
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Categories.all.forEach { c ->
                     FilterChip(
-                        selected = payerId == p.id,
-                        onClick = { payerId = p.id },
-                        label = { Text(p.name) }
+                        selected = category == c,
+                        onClick = { category = if (category == c) "" else c },
+                        label = { Text(c) }
                     )
                 }
             }
+
+            Spacer(Modifier.height(24.dp))
+            SectionLabel("When")
+            DateRow(createdAt) { createdAt = it }
+
+            Spacer(Modifier.height(24.dp))
+            SectionLabel("Paid by")
+            PersonChips(trip, isSelected = { it == payerId }, onClick = { payerId = it })
 
             Spacer(Modifier.height(28.dp))
             SectionLabel("Split between")
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                trip.people.forEach { p ->
-                    FilterChip(
-                        selected = sharedBy.contains(p.id),
-                        onClick = {
-                            if (sharedBy.contains(p.id)) sharedBy.remove(p.id) else sharedBy.add(p.id)
-                        },
-                        label = { Text(p.name) }
-                    )
-                }
-            }
-            Spacer(Modifier.height(12.dp))
+            PersonChips(
+                trip,
+                isSelected = { sharedBy.contains(it) },
+                onClick = { if (sharedBy.contains(it)) sharedBy.remove(it) else sharedBy.add(it) }
+            )
+            Spacer(Modifier.height(4.dp))
             Row {
                 TextButton(onClick = {
                     sharedBy.clear()
@@ -470,18 +675,170 @@ fun EditExpenseScreen(
                 }) { Text("Just the payer") }
             }
 
-            if (homeMinor != null && sharedBy.isNotEmpty()) {
+            if (participants.size > 1) {
+                Spacer(Modifier.height(16.dp))
+                SectionLabel("How")
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    FilterChip(
+                        selected = mode == SplitMode.Equal,
+                        onClick = { mode = SplitMode.Equal },
+                        label = { Text("Equally") }
+                    )
+                    FilterChip(
+                        selected = mode == SplitMode.Shares,
+                        onClick = { mode = SplitMode.Shares },
+                        label = { Text("By shares") }
+                    )
+                    FilterChip(
+                        selected = mode == SplitMode.Exact,
+                        onClick = { mode = SplitMode.Exact },
+                        label = { Text("Exact amounts") }
+                    )
+                }
+
+                when (mode) {
+                    SplitMode.Equal -> {}
+                    SplitMode.Shares -> {
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "One share each is an even split. Give someone two if they " +
+                                "had double, or none if they sat it out.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MoneySlate
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        participants.forEach { id ->
+                            val count = (sharesText[id]?.toLongOrNull() ?: 1L).coerceAtLeast(0L)
+                            Row(
+                                Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Avatar(trip, id, 28.dp)
+                                Spacer(Modifier.width(10.dp))
+                                Text(
+                                    trip.nameOf(id),
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    modifier = Modifier.weight(1f),
+                                    maxLines = 1
+                                )
+                                IconButton(
+                                    onClick = { sharesText[id] = (count - 1L).coerceAtLeast(0L).toString() },
+                                    enabled = count > 0L
+                                ) { Text("−", style = MaterialTheme.typography.titleLarge) }
+                                Text(
+                                    count.toString(),
+                                    style = MaterialTheme.typography.titleMedium,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.width(30.dp)
+                                )
+                                IconButton(
+                                    onClick = { sharesText[id] = (count + 1L).toString() }
+                                ) { Text("+", style = MaterialTheme.typography.titleLarge) }
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    preview?.get(id)?.let { Money.format(it) } ?: "—",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    color = if (count > 0L) MaterialTheme.colorScheme.onBackground else MoneySlate,
+                                    textAlign = TextAlign.End,
+                                    modifier = Modifier.width(96.dp)
+                                )
+                            }
+                        }
+                    }
+                    SplitMode.Exact -> {
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "Type each person's amount in " + typedCode + ". They have to " +
+                                "add up to the total.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MoneySlate
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        participants.forEach { id ->
+                            Row(
+                                Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Avatar(trip, id, 28.dp)
+                                Spacer(Modifier.width(10.dp))
+                                Text(
+                                    trip.nameOf(id),
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    modifier = Modifier.weight(1f),
+                                    maxLines = 1
+                                )
+                                OutlinedTextField(
+                                    value = exactText[id] ?: "",
+                                    onValueChange = { exactText[id] = it },
+                                    singleLine = true,
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                                    label = { Text(typedCode) },
+                                    modifier = Modifier.width(160.dp)
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        if (typedMinor == null) {
+                            Text(
+                                "Enter the total first.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MoneySlate
+                            )
+                        } else {
+                            val left = typedMinor - assigned
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = when {
+                                        left == 0L -> "Adds up to " + Money.format(typedMinor) + "."
+                                        left > 0L -> Money.format(left) + " still to assign."
+                                        else -> "Over by " + Money.format(-left) + "."
+                                    },
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    color = when {
+                                        left == 0L -> MoneyGold
+                                        left > 0L -> MoneySlate
+                                        else -> MoneyOwed
+                                    },
+                                    modifier = Modifier.weight(1f)
+                                )
+                                if (left > 0L) {
+                                    TextButton(onClick = {
+                                        val blank = participants.filter {
+                                            (Money.parse(exactText[it] ?: "") ?: 0L) == 0L
+                                        }
+                                        val targets = if (blank.isEmpty()) participants else blank
+                                        Settle.shares(left, targets).forEach { (id, add) ->
+                                            val current = Money.parse(exactText[id] ?: "") ?: 0L
+                                            exactText[id] = Money.format(current + add)
+                                        }
+                                    }) { Text("Split the rest") }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (preview != null) {
                 Spacer(Modifier.height(14.dp))
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline)
                 Spacer(Modifier.height(14.dp))
-                val each = Settle.shares(homeMinor, sharedBy.toList())
-                val values = each.values.distinct().sorted()
+                val values = preview.values.distinct().sorted()
                 Text(
-                    text = if (values.size <= 1)
-                        Money.withCode(values.firstOrNull() ?: 0L, trip.homeCurrency) + " each"
-                    else
-                        Money.format(values.last()) + " for some, " +
-                            Money.format(values.first()) + " for others — the odd cents have to land somewhere",
+                    text = when {
+                        values.size <= 1 ->
+                            Money.withCode(values.firstOrNull() ?: 0L, trip.homeCurrency) + " each"
+                        mode == SplitMode.Equal ->
+                            Money.format(values.last()) + " for some, " +
+                                Money.format(values.first()) +
+                                " for others — the odd cents have to land somewhere"
+                        else -> savedParticipants.joinToString(" · ") {
+                            trip.nameOf(it) + " " + Money.format(preview[it] ?: 0L)
+                        } + (if (usingLocal) " (" + trip.homeCurrency + ")" else "")
+                    },
                     style = MaterialTheme.typography.bodyLarge,
                     color = MoneySlate
                 )
@@ -495,11 +852,13 @@ fun EditExpenseScreen(
                             id = existing?.id ?: newId(),
                             note = note.trim(),
                             payerId = payerId,
-                            sharedBy = sharedBy.toList(),
+                            sharedBy = savedParticipants,
                             homeMinor = homeMinor,
-                            localMinor = if (inLocal && trip.hasLocalCurrency) typedMinor else null,
-                            rateUsed = if (inLocal && trip.hasLocalCurrency) trip.rate else null,
-                            createdAt = existing?.createdAt ?: System.currentTimeMillis()
+                            localMinor = if (usingLocal) typedMinor else null,
+                            rateUsed = if (usingLocal) rateInUse else null,
+                            createdAt = createdAt,
+                            category = category,
+                            weights = savedWeights
                         )
                     )
                 },
@@ -520,7 +879,6 @@ fun EditExpenseScreen(
  * settle-up line (prefilled with the exact figure), or from scratch for a
  * partial repayment.
  */
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun PaymentScreen(
     trip: Trip,
@@ -532,68 +890,50 @@ fun PaymentScreen(
     onDelete: (String) -> Unit,
     onCancel: () -> Unit
 ) {
-    var amountText by remember {
+    var amountText by rememberSaveable {
         mutableStateOf(
             when {
-                existing?.localMinor != null -> Money.format(existing.localMinor)
+                existing?.localMinor != null && trip.hasLocalCurrency -> Money.format(existing.localMinor)
                 existing != null -> Money.format(existing.homeMinor)
                 suggestedMinor != null -> Money.format(suggestedMinor)
                 else -> ""
             }
         )
     }
-    var inLocal by remember { mutableStateOf(existing?.localMinor != null) }
-    var note by remember { mutableStateOf(existing?.note ?: "") }
-    var fromId by remember { mutableStateOf(existing?.fromId ?: suggestedFromId ?: "") }
-    var toId by remember { mutableStateOf(existing?.toId ?: suggestedToId ?: "") }
-    var confirmDelete by remember { mutableStateOf(false) }
+    var inLocal by rememberSaveable {
+        mutableStateOf(existing?.localMinor != null && trip.hasLocalCurrency)
+    }
+    var rateInUse by rememberSaveable { mutableStateOf(existing?.rateUsed ?: trip.rate) }
+    var note by rememberSaveable { mutableStateOf(existing?.note ?: "") }
+    var fromId by rememberSaveable { mutableStateOf(existing?.fromId ?: suggestedFromId ?: "") }
+    var toId by rememberSaveable { mutableStateOf(existing?.toId ?: suggestedToId ?: "") }
+    var createdAt by rememberSaveable {
+        mutableStateOf(existing?.createdAt?.takeIf { it > 0L } ?: System.currentTimeMillis())
+    }
 
     val typedMinor = Money.parse(amountText)
+    val usingLocal = inLocal && trip.hasLocalCurrency
     val homeMinor = when {
         typedMinor == null -> null
-        inLocal && trip.hasLocalCurrency -> Money.convert(typedMinor, trip.rate)
+        usingLocal -> Money.convert(typedMinor, rateInUse)
         else -> typedMinor
     }
     val samePerson = fromId.isNotBlank() && fromId == toId
     val valid = homeMinor != null && homeMinor > 0L &&
         fromId.isNotBlank() && toId.isNotBlank() && !samePerson
 
-    if (confirmDelete && existing != null) {
-        AlertDialog(
-            onDismissRequest = { confirmDelete = false },
-            title = { Text("Delete this repayment?") },
-            text = { Text("The debt it cleared will reappear in the settle-up.") },
-            confirmButton = {
-                TextButton(onClick = { confirmDelete = false; onDelete(existing.id) }) {
-                    Text("Delete")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { confirmDelete = false }) { Text("Keep it") }
-            }
-        )
+    val amountFocus = remember { FocusRequester() }
+    LaunchedEffect(Unit) {
+        if (existing == null && suggestedMinor == null) amountFocus.requestFocus()
     }
 
     Scaffold(
+        snackbarHost = { SnackbarHost(LocalSnackbar.current) },
         topBar = {
-            TopAppBar(
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.background,
-                    titleContentColor = MaterialTheme.colorScheme.onBackground
-                ),
-                title = { Text(if (existing == null) "Record a repayment" else "Edit repayment") },
-                navigationIcon = {
-                    IconButton(onClick = onCancel) {
-                        Icon(Icons.Default.Close, contentDescription = "Cancel")
-                    }
-                },
-                actions = {
-                    if (existing != null) {
-                        IconButton(onClick = { confirmDelete = true }) {
-                            Icon(Icons.Default.Delete, contentDescription = "Delete")
-                        }
-                    }
-                }
+            FormTopBar(
+                title = if (existing == null) "Record a repayment" else "Edit repayment",
+                onBack = onCancel,
+                onDelete = if (existing != null) ({ onDelete(existing.id) }) else null
             )
         }
     ) { inner ->
@@ -619,56 +959,34 @@ fun PaymentScreen(
                 label = { Text("Amount handed over") },
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth().focusRequester(amountFocus)
             )
 
             if (trip.hasLocalCurrency) {
                 Spacer(Modifier.height(12.dp))
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(
-                        selected = !inLocal,
-                        onClick = { inLocal = false },
-                        label = { Text(trip.homeCurrency) }
-                    )
-                    FilterChip(
-                        selected = inLocal,
-                        onClick = { inLocal = true },
-                        label = { Text(trip.localCurrency) }
-                    )
-                }
-                if (inLocal && homeMinor != null) {
-                    Spacer(Modifier.height(10.dp))
-                    Text(
-                        "= " + Money.withCode(homeMinor, trip.homeCurrency) + " at " + trip.rate,
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = MoneyGold
-                    )
-                }
-            }
-
-            Spacer(Modifier.height(28.dp))
-            SectionLabel("Who paid")
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                trip.people.forEach { p ->
-                    FilterChip(
-                        selected = fromId == p.id,
-                        onClick = { fromId = p.id },
-                        label = { Text(p.name) }
+                CurrencyToggle(trip, inLocal) { inLocal = it }
+                if (usingLocal) {
+                    RateLine(
+                        trip = trip,
+                        homeMinor = homeMinor,
+                        rateInUse = rateInUse,
+                        originalRate = existing?.rateUsed,
+                        onUseRate = { rateInUse = it }
                     )
                 }
             }
 
             Spacer(Modifier.height(24.dp))
+            SectionLabel("When")
+            DateRow(createdAt) { createdAt = it }
+
+            Spacer(Modifier.height(24.dp))
+            SectionLabel("Who paid")
+            PersonChips(trip, isSelected = { it == fromId }, onClick = { fromId = it })
+
+            Spacer(Modifier.height(24.dp))
             SectionLabel("Who received it")
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                trip.people.forEach { p ->
-                    FilterChip(
-                        selected = toId == p.id,
-                        onClick = { toId = p.id },
-                        label = { Text(p.name) }
-                    )
-                }
-            }
+            PersonChips(trip, isSelected = { it == toId }, onClick = { toId = it })
             if (samePerson) {
                 Spacer(Modifier.height(10.dp))
                 Text(
@@ -697,9 +1015,9 @@ fun PaymentScreen(
                             toId = toId,
                             homeMinor = homeMinor,
                             note = note.trim(),
-                            localMinor = if (inLocal && trip.hasLocalCurrency) typedMinor else null,
-                            rateUsed = if (inLocal && trip.hasLocalCurrency) trip.rate else null,
-                            createdAt = existing?.createdAt ?: System.currentTimeMillis()
+                            localMinor = if (usingLocal) typedMinor else null,
+                            rateUsed = if (usingLocal) rateInUse else null,
+                            createdAt = createdAt
                         )
                     )
                 },

@@ -44,21 +44,53 @@ data class PairDebt(
 object Settle {
 
     /**
-     * Divides an amount into whole cents. A 100c dinner for three is 34/33/33,
-     * not three lots of 33.33 that quietly lose a cent. The extra cents go to
-     * the earliest ids in a stable order so the parts always re-sum to the whole.
+     * Divides an amount into whole cents in proportion to [weights] (equal when
+     * null). A 100c dinner for three is 34/33/33, not three lots of 33.33 that
+     * quietly lose a cent. Leftover cents go to whoever was rounded down the
+     * most, ties broken by id, so the parts always re-sum to the whole and the
+     * same inputs always give the same answer.
+     *
+     * Weights that are exact cents summing to the total come back unchanged,
+     * which is what makes a hand-typed split just another set of weights.
      */
-    fun shares(totalMinor: Long, personIds: List<String>): Map<String, Long> {
+    fun shares(
+        totalMinor: Long,
+        personIds: List<String>,
+        weights: Map<String, Long>? = null
+    ): Map<String, Long> {
         val ordered = personIds.distinct().sorted()
         if (ordered.isEmpty()) return emptyMap()
-        val base = totalMinor / ordered.size
-        val remainder = (totalMinor % ordered.size).toInt()
-        val out = LinkedHashMap<String, Long>()
-        ordered.forEachIndexed { i, id ->
-            out[id] = base + if (i < remainder) 1L else 0L
+
+        val w = LongArray(ordered.size) { i -> (weights?.get(ordered[i]) ?: 1L).coerceAtLeast(0L) }
+        val sumW = w.sum()
+        if (sumW <= 0L) return shares(totalMinor, personIds, null)
+
+        val floors = LongArray(ordered.size)
+        val remainders = LongArray(ordered.size)
+        for (i in ordered.indices) {
+            val scaled = totalMinor * w[i]
+            floors[i] = Math.floorDiv(scaled, sumW)
+            remainders[i] = Math.floorMod(scaled, sumW)
         }
+        var left = totalMinor - floors.sum()
+        val byRemainder = ordered.indices.sortedWith(
+            compareByDescending<Int> { remainders[it] }.thenBy { it }
+        )
+        for (i in byRemainder) {
+            if (left <= 0L) break
+            if (w[i] > 0L) {
+                floors[i] += 1L
+                left -= 1L
+            }
+        }
+
+        val out = LinkedHashMap<String, Long>()
+        ordered.forEachIndexed { i, id -> out[id] = floors[i] }
         return out
     }
+
+    fun shares(expense: Expense): Map<String, Long> =
+        shares(expense.homeMinor, expense.sharedBy, expense.weights)
 
     fun balances(trip: Trip): List<Balance> {
         val paid = HashMap<String, Long>()
@@ -68,7 +100,7 @@ object Settle {
 
         for (e in trip.expenses) {
             paid[e.payerId] = (paid[e.payerId] ?: 0L) + e.homeMinor
-            for ((id, share) in shares(e.homeMinor, e.sharedBy)) {
+            for ((id, share) in shares(e)) {
                 owed[id] = (owed[id] ?: 0L) + share
             }
         }
@@ -133,7 +165,7 @@ object Settle {
      */
     fun pairDebts(trip: Trip): List<PairDebt> {
         val ids = trip.people.map { it.id }
-        val shareCache = trip.expenses.associate { it.id to shares(it.homeMinor, it.sharedBy) }
+        val shareCache = trip.expenses.associate { it.id to shares(it) }
         val out = ArrayList<PairDebt>()
 
         for (i in ids.indices) {
@@ -208,7 +240,24 @@ object Settle {
 
     /** This person's slice of one expense. */
     fun shareOf(expense: Expense, personId: String): Long =
-        shares(expense.homeMinor, expense.sharedBy)[personId] ?: 0L
+        shares(expense)[personId] ?: 0L
+
+    /** Trip spending per category, biggest first. Blank categories pool together. */
+    fun byCategory(trip: Trip): List<Pair<String, Long>> =
+        trip.expenses
+            .groupBy { it.category.ifBlank { Categories.UNCATEGORISED } }
+            .map { (category, list) -> category to list.sumOf { it.homeMinor } }
+            .filter { it.second != 0L }
+            .sortedByDescending { it.second }
+
+    /** One person's own share of spending per category, biggest first. */
+    fun shareByCategory(trip: Trip, personId: String): List<Pair<String, Long>> =
+        trip.expenses
+            .filter { it.sharedBy.contains(personId) }
+            .groupBy { it.category.ifBlank { Categories.UNCATEGORISED } }
+            .map { (category, list) -> category to list.sumOf { shareOf(it, personId) } }
+            .filter { it.second != 0L }
+            .sortedByDescending { it.second }
 
     /** Plain-text summary, for sending to the group chat. */
     fun summary(trip: Trip): String {
@@ -219,6 +268,12 @@ object Settle {
         if (trip.settledMinor > 0L) {
             sb.append("Already settled: ")
                 .append(Money.withCode(trip.settledMinor, trip.homeCurrency)).append("\n")
+        }
+        val categories = byCategory(trip)
+        if (categories.size > 1 || (categories.size == 1 && categories[0].first != Categories.UNCATEGORISED)) {
+            sb.append("By category: ")
+                .append(categories.joinToString(", ") { it.first + " " + Money.format(it.second) })
+                .append("\n")
         }
         sb.append("\n")
 
