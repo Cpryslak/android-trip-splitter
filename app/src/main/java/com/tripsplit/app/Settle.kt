@@ -21,6 +21,26 @@ data class Transfer(
     val amountMinor: Long
 )
 
+/** One reason inside a pair's balance: an expense share, or a repayment. */
+data class DebtLine(
+    val label: String,
+    val amountMinor: Long,
+    val expenseId: String? = null,
+    val paymentId: String? = null
+)
+
+/**
+ * What one person owes another, counting only what actually passed between the
+ * two of them. [lines] is the working: positive entries add to the debt,
+ * negative ones (the other direction, or a repayment) subtract.
+ */
+data class PairDebt(
+    val fromId: String,
+    val toId: String,
+    val amountMinor: Long,
+    val lines: List<DebtLine>
+)
+
 object Settle {
 
     /**
@@ -103,6 +123,93 @@ object Settle {
         return out
     }
 
+    /**
+     * Who owes whom, pair by pair. Only expenses the two people actually shared
+     * count, so nobody is ever told to pay someone they never transacted with —
+     * which is what global netting does, and what made the old screen confusing.
+     *
+     * The sum of a person's pair debts always equals their net in [balances], so
+     * this can't disagree with the balances above it.
+     */
+    fun pairDebts(trip: Trip): List<PairDebt> {
+        val ids = trip.people.map { it.id }
+        val shareCache = trip.expenses.associate { it.id to shares(it.homeMinor, it.sharedBy) }
+        val out = ArrayList<PairDebt>()
+
+        for (i in ids.indices) {
+            for (j in i + 1 until ids.size) {
+                val a = ids[i]
+                val b = ids[j]
+                var balance = 0L // positive means a owes b
+                val lines = ArrayList<DebtLine>()
+
+                for (e in trip.expenses) {
+                    val sh = shareCache[e.id] ?: continue
+                    val label = if (e.note.isBlank()) "Expense" else e.note
+                    if (e.payerId == b) {
+                        val owed = sh[a] ?: 0L
+                        if (owed > 0L) {
+                            balance += owed
+                            lines.add(DebtLine(label, owed, expenseId = e.id))
+                        }
+                    } else if (e.payerId == a) {
+                        val owed = sh[b] ?: 0L
+                        if (owed > 0L) {
+                            balance -= owed
+                            lines.add(DebtLine(label, -owed, expenseId = e.id))
+                        }
+                    }
+                }
+
+                for (p in trip.payments) {
+                    if (p.fromId == p.toId) continue
+                    val label = if (p.note.isBlank()) "Repayment" else "Repayment · " + p.note
+                    if (p.fromId == a && p.toId == b) {
+                        balance -= p.homeMinor
+                        lines.add(DebtLine(label, -p.homeMinor, paymentId = p.id))
+                    } else if (p.fromId == b && p.toId == a) {
+                        balance += p.homeMinor
+                        lines.add(DebtLine(label, p.homeMinor, paymentId = p.id))
+                    }
+                }
+
+                when {
+                    balance > 0L -> out.add(PairDebt(a, b, balance, lines))
+                    balance < 0L -> out.add(
+                        // Flip the direction and the working with it.
+                        PairDebt(b, a, -balance, lines.map { it.copy(amountMinor = -it.amountMinor) })
+                    )
+                }
+            }
+        }
+        return out
+    }
+
+    /** The same debts grouped under whoever has to pay them, biggest debtor first. */
+    fun debtsByPerson(trip: Trip): List<Pair<String, List<PairDebt>>> =
+        pairDebts(trip)
+            .groupBy { it.fromId }
+            .map { (from, debts) -> from to debts.sortedByDescending { it.amountMinor } }
+            .sortedByDescending { (_, debts) -> debts.sumOf { it.amountMinor } }
+
+    /** Everything one person is involved in, for their own page. */
+    fun expensesPaidBy(trip: Trip, personId: String): List<Expense> =
+        trip.expenses.filter { it.payerId == personId }.sortedByDescending { it.createdAt }
+
+    fun expensesSharedBy(trip: Trip, personId: String): List<Expense> =
+        trip.expenses
+            .filter { it.payerId != personId && it.sharedBy.contains(personId) }
+            .sortedByDescending { it.createdAt }
+
+    fun paymentsInvolving(trip: Trip, personId: String): List<Payment> =
+        trip.payments
+            .filter { it.fromId == personId || it.toId == personId }
+            .sortedByDescending { it.createdAt }
+
+    /** This person's slice of one expense. */
+    fun shareOf(expense: Expense, personId: String): Long =
+        shares(expense.homeMinor, expense.sharedBy)[personId] ?: 0L
+
     /** Plain-text summary, for sending to the group chat. */
     fun summary(trip: Trip): String {
         val sb = StringBuilder()
@@ -124,16 +231,19 @@ object Settle {
             sb.append("\n")
         }
 
-        val moves = transfers(balances(trip))
+        val grouped = debtsByPerson(trip)
         sb.append("\nStill to settle:\n")
-        if (moves.isEmpty()) {
+        if (grouped.isEmpty()) {
             sb.append("Nothing owed. Everyone is square.\n")
         } else {
-            for (t in moves) {
-                sb.append("  ").append(trip.nameOf(t.fromId))
-                    .append(" pays ").append(trip.nameOf(t.toId))
-                    .append(" ").append(Money.withCode(t.amountMinor, trip.homeCurrency))
+            for ((fromId, debts) in grouped) {
+                sb.append("  ").append(trip.nameOf(fromId)).append(" owes ")
+                    .append(Money.withCode(debts.sumOf { it.amountMinor }, trip.homeCurrency))
                     .append("\n")
+                for (d in debts) {
+                    sb.append("      to ").append(trip.nameOf(d.toId))
+                        .append(" ").append(Money.format(d.amountMinor)).append("\n")
+                }
             }
         }
         return sb.toString()

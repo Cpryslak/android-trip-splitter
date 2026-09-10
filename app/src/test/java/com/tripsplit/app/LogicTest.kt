@@ -260,6 +260,158 @@ class SettleTest {
     }
 }
 
+class PairDebtTest {
+
+    private fun person(n: String) = Person(n.lowercase(), n)
+
+    private fun expense(id: String, payer: String, amount: Long, sharedBy: List<String>) =
+        Expense(
+            id = id,
+            note = id,
+            payerId = payer.lowercase(),
+            sharedBy = sharedBy.map { it.lowercase() },
+            homeMinor = amount
+        )
+
+    private fun trip(people: List<String>, expenses: List<Expense>, payments: List<Payment> = emptyList()) =
+        Trip(
+            id = "t",
+            name = "Test",
+            people = people.map { person(it) },
+            expenses = expenses,
+            payments = payments,
+            started = true
+        )
+
+    @Test fun nobodyOwesSomeoneTheyNeverSharedAnExpenseWith() {
+        // Chris pays for Mike; Jake is on the trip but shares nothing with Mike.
+        val t = trip(
+            listOf("Chris", "Mike", "Jake"),
+            listOf(
+                expense("hotel", "Chris", 20000L, listOf("Chris", "Mike")),
+                expense("cab", "Chris", 6000L, listOf("Chris", "Jake"))
+            )
+        )
+        val debts = Settle.pairDebts(t)
+        assertTrue(debts.none { it.fromId == "mike" && it.toId == "jake" })
+        assertTrue(debts.none { it.fromId == "jake" && it.toId == "mike" })
+        assertEquals(2, debts.size)
+    }
+
+    @Test fun mutualDebtsInsideAPairCancelToOneFigure() {
+        val t = trip(
+            listOf("Chris", "Mike"),
+            listOf(
+                expense("hotel", "Chris", 20000L, listOf("Chris", "Mike")),
+                expense("taxi", "Mike", 8000L, listOf("Chris", "Mike"))
+            )
+        )
+        val debts = Settle.pairDebts(t)
+        assertEquals(1, debts.size)
+        assertEquals("mike", debts[0].fromId)
+        assertEquals("chris", debts[0].toId)
+        assertEquals(6000L, debts[0].amountMinor) // 10000 owed less 4000 owed back
+    }
+
+    @Test fun theWorkingAlwaysAddsUpToTheFigure() {
+        val t = trip(
+            listOf("Chris", "Mike"),
+            listOf(
+                expense("hotel", "Chris", 20000L, listOf("Chris", "Mike")),
+                expense("taxi", "Mike", 8000L, listOf("Chris", "Mike"))
+            ),
+            listOf(Payment(id = "p", fromId = "mike", toId = "chris", homeMinor = 1000L))
+        )
+        Settle.pairDebts(t).forEach { d ->
+            assertEquals(d.amountMinor, d.lines.sumOf { it.amountMinor })
+        }
+    }
+
+    @Test fun pairDebtsAgreeWithEveryPersonsNet() {
+        val names = listOf("Chris", "Mike", "Tanner", "Jake", "Pat", "Sam")
+        val r = Random(5)
+        repeat(3000) {
+            val group = names.shuffled(r).take(3 + r.nextInt(4))
+            val expenses = (0 until 1 + r.nextInt(14)).map { i ->
+                expense(
+                    "e$i",
+                    group[r.nextInt(group.size)],
+                    1L + r.nextLong(400_000L),
+                    group.shuffled(r).take(1 + r.nextInt(group.size))
+                )
+            }
+            val payments = (0 until r.nextInt(6)).map { i ->
+                Payment(
+                    id = "p$i",
+                    fromId = group[r.nextInt(group.size)].lowercase(),
+                    toId = group[r.nextInt(group.size)].lowercase(),
+                    homeMinor = 1L + r.nextLong(150_000L)
+                )
+            }
+            val t = trip(group, expenses, payments)
+            val debts = Settle.pairDebts(t)
+
+            assertTrue("a pair debt pointed at itself", debts.all { it.fromId != it.toId })
+            assertTrue(debts.all { it.amountMinor > 0L })
+
+            // The screens must not contradict each other: what a person owes
+            // across all their pairs has to equal their headline net.
+            Settle.balances(t).forEach { b ->
+                val owedTo = debts.filter { it.toId == b.personId }.sumOf { it.amountMinor }
+                val owes = debts.filter { it.fromId == b.personId }.sumOf { it.amountMinor }
+                assertEquals(b.netMinor, owedTo - owes)
+            }
+
+            // And paying every line clears the board.
+            val after = HashMap<String, Long>()
+            Settle.balances(t).forEach { after[it.personId] = it.netMinor }
+            debts.forEach { d ->
+                after[d.fromId] = (after[d.fromId] ?: 0L) + d.amountMinor
+                after[d.toId] = (after[d.toId] ?: 0L) - d.amountMinor
+            }
+            assertTrue(after.values.all { it == 0L })
+        }
+    }
+
+    @Test fun markingAPairPaidClearsThatLineOnly() {
+        val t = trip(
+            listOf("Chris", "Mike", "Tanner"),
+            listOf(expense("hotel", "Chris", 30000L, listOf("Chris", "Mike", "Tanner")))
+        )
+        val owed = Settle.pairDebts(t).first { it.fromId == "tanner" }.amountMinor
+        val after = t.copy(
+            payments = listOf(Payment(id = "p", fromId = "tanner", toId = "chris", homeMinor = owed))
+        )
+        val debts = Settle.pairDebts(after)
+        assertEquals(1, debts.size)
+        assertEquals("mike", debts[0].fromId)
+    }
+
+    @Test fun groupingPutsEachDebtorTogetherBiggestFirst() {
+        val t = trip(
+            listOf("Chris", "Mike", "Tanner", "Jake"),
+            listOf(
+                expense("hotel", "Chris", 40000L, listOf("Chris", "Mike", "Tanner", "Jake")),
+                expense("cab", "Mike", 12000L, listOf("Mike", "Tanner"))
+            )
+        )
+        val grouped = Settle.debtsByPerson(t)
+        // Tanner owes two people, everyone else owes one
+        val tanner = grouped.first { it.first == "tanner" }
+        assertEquals(2, tanner.second.size)
+        // biggest debtor listed first
+        val totals = grouped.map { (_, d) -> d.sumOf { it.amountMinor } }
+        assertEquals(totals.sortedDescending(), totals)
+    }
+
+    @Test fun shareOfIsTheirSliceOfThatExpense() {
+        val e = expense("dinner", "Chris", 10000L, listOf("Chris", "Mike", "Tanner"))
+        val total = listOf("chris", "mike", "tanner").sumOf { Settle.shareOf(e, it) }
+        assertEquals(10000L, total)
+        assertEquals(0L, Settle.shareOf(e, "jake"))
+    }
+}
+
 class LibraryTest {
 
     private fun trip(id: String, name: String, created: Long, expenses: List<Expense> = emptyList()) =

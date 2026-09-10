@@ -23,6 +23,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
@@ -58,6 +59,7 @@ sealed interface Screen {
     data object Setup : Screen
     data object NewTrip : Screen
     data class Edit(val expenseId: String?) : Screen
+    data class PersonDetail(val personId: String) : Screen
     data class Pay(
         val paymentId: String?,
         val fromId: String? = null,
@@ -162,10 +164,22 @@ fun AppRoot() {
                 },
                 onCancel = { screen = Screen.Ledger }
             )
+            is Screen.PersonDetail -> PersonScreen(
+                trip = trip,
+                personId = s.personId,
+                onOpenExpense = { id -> screen = Screen.Edit(id) },
+                onOpenPayment = { id -> screen = Screen.Pay(id) },
+                onRecordPayment = { from, to, amount ->
+                    screen = Screen.Pay(null, from, to, amount)
+                },
+                onCancel = { screen = Screen.Ledger }
+            )
             is Screen.Ledger -> LedgerScreen(
                 library = library,
                 trip = trip,
                 onAdd = { screen = Screen.Edit(null) },
+                onAddPayment = { screen = Screen.Pay(null) },
+                onOpenPerson = { id -> screen = Screen.PersonDetail(id) },
                 onOpenExpense = { id -> screen = Screen.Edit(id) },
                 onOpenPayment = { id -> screen = Screen.Pay(id) },
                 onRecordPayment = { from, to, amount ->
@@ -193,6 +207,8 @@ private fun LedgerScreen(
     library: Library,
     trip: Trip,
     onAdd: () -> Unit,
+    onAddPayment: () -> Unit,
+    onOpenPerson: (String) -> Unit,
     onOpenExpense: (String) -> Unit,
     onOpenPayment: (String) -> Unit,
     onRecordPayment: (String?, String?, Long?) -> Unit,
@@ -202,6 +218,27 @@ private fun LedgerScreen(
     onRestore: (Library) -> Pair<Int, Int>
 ) {
     var pane by remember { mutableStateOf(Pane.Ledger) }
+    var chooseKind by remember { mutableStateOf(false) }
+
+    if (chooseKind) {
+        AlertDialog(
+            onDismissRequest = { chooseKind = false },
+            title = { Text("What are you adding?") },
+            text = {
+                Text(
+                    "An expense is a trip cost, split between whoever it covered. " +
+                        "A repayment is money handed straight from one person to " +
+                        "another, and never gets split."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { chooseKind = false; onAdd() }) { Text("Expense") }
+            },
+            dismissButton = {
+                TextButton(onClick = { chooseKind = false; onAddPayment() }) { Text("Repayment") }
+            }
+        )
+    }
     val ctx = LocalContext.current
     val share: () -> Unit = {
         val intent = Intent(Intent.ACTION_SEND).apply {
@@ -248,13 +285,13 @@ private fun LedgerScreen(
         },
         floatingActionButton = {
             FloatingActionButton(
-                onClick = { if (pane == Pane.Trips) onNewTrip() else onAdd() },
+                onClick = { if (pane == Pane.Trips) onNewTrip() else chooseKind = true },
                 containerColor = MoneyGold
             ) {
                 Icon(
                     Icons.Default.Add,
                     contentDescription = if (pane == Pane.Trips) "Start a new trip"
-                    else "Add an expense"
+                    else "Add an expense or a repayment"
                 )
             }
         }
@@ -303,7 +340,7 @@ private fun LedgerScreen(
                                     .verticalScroll(rememberScrollState())
                                     .padding(20.dp)
                             ) {
-                                BalancesPane(trip, onRecordPayment)
+                                BalancesPane(trip, onOpenPerson, onRecordPayment)
                             }
                         }
                     } else {
@@ -316,7 +353,7 @@ private fun LedgerScreen(
                             .verticalScroll(rememberScrollState())
                             .padding(20.dp)
                     ) {
-                        BalancesPane(trip, onRecordPayment)
+                        BalancesPane(trip, onOpenPerson, onRecordPayment)
                     }
 
                     Pane.Trips -> Box(
@@ -479,32 +516,39 @@ private fun PaymentRow(trip: Trip, p: Payment, onClick: () -> Unit) {
 @Composable
 private fun BalancesPane(
     trip: Trip,
+    onOpenPerson: (String) -> Unit,
     onRecordPayment: (String?, String?, Long?) -> Unit
 ) {
     val balances = Settle.balances(trip)
-    val moves = Settle.transfers(balances)
+    val grouped = Settle.debtsByPerson(trip)
 
     Column {
         Text("Where everyone stands", style = MaterialTheme.typography.headlineSmall)
-        Spacer(Modifier.height(14.dp))
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "Tap a name for their full breakdown.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MoneySlate
+        )
+        Spacer(Modifier.height(12.dp))
 
         balances.forEach { b ->
-            Row(Modifier.fillMaxWidth().padding(vertical = 9.dp)) {
-                Column(Modifier.weight(1f)) {
-                    Text(trip.nameOf(b.personId), style = MaterialTheme.typography.titleMedium)
-                    val detail = StringBuilder()
-                    detail.append("paid ").append(Money.format(b.paidMinor))
-                    detail.append(" · owes ").append(Money.format(b.shareMinor))
-                    if (b.sentMinor > 0L) detail.append(" · repaid ").append(Money.format(b.sentMinor))
-                    if (b.receivedMinor > 0L) detail.append(" · got back ").append(Money.format(b.receivedMinor))
-                    Text(
-                        detail.toString(),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MoneySlate
-                    )
-                }
+            val net = b.netMinor
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable { onOpenPerson(b.personId) }
+                    .padding(vertical = 13.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = trip.nameOf(b.personId),
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.weight(1f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
                 Column(horizontalAlignment = Alignment.End) {
-                    val net = b.netMinor
                     Text(
                         text = when {
                             net > 0L -> "+" + Money.format(net)
@@ -528,17 +572,21 @@ private fun BalancesPane(
                         color = MoneySlate
                     )
                 }
+                Spacer(Modifier.width(10.dp))
+                Icon(
+                    Icons.Default.KeyboardArrowRight,
+                    contentDescription = null,
+                    tint = MoneySlate
+                )
             }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline)
         }
 
-        Spacer(Modifier.height(18.dp))
-        HorizontalDivider(color = MoneyGold)
-        Spacer(Modifier.height(18.dp))
-
+        Spacer(Modifier.height(26.dp))
         Text("Still to settle", style = MaterialTheme.typography.headlineSmall)
         Spacer(Modifier.height(6.dp))
 
-        if (moves.isEmpty()) {
+        if (grouped.isEmpty()) {
             Text(
                 text = when {
                     trip.expenses.isEmpty() -> "Nothing to settle yet."
@@ -550,41 +598,117 @@ private fun BalancesPane(
             )
         } else {
             Text(
-                "The fewest payments that clear what's left. Tap Mark paid once the " +
-                    "money has actually changed hands.",
+                "Each line counts only what passed between those two people, so " +
+                    "everybody can check their own. Mark them off as the money moves.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MoneySlate
             )
-            Spacer(Modifier.height(12.dp))
-            moves.forEach { t ->
-                Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            text = trip.nameOf(t.fromId) + "  →  " + trip.nameOf(t.toId),
-                            style = MaterialTheme.typography.bodyLarge,
-                            modifier = Modifier.weight(1f)
-                        )
-                        Text(
-                            text = Money.withCode(t.amountMinor, trip.homeCurrency),
-                            style = MaterialTheme.typography.titleMedium,
-                            color = MoneyGold
-                        )
-                    }
-                    Spacer(Modifier.height(6.dp))
-                    OutlinedButton(
-                        onClick = { onRecordPayment(t.fromId, t.toId, t.amountMinor) }
-                    ) {
-                        Text("Mark paid")
-                    }
+            Spacer(Modifier.height(8.dp))
+
+            grouped.forEach { (fromId, debts) ->
+                Spacer(Modifier.height(16.dp))
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = trip.nameOf(fromId) + " owes",
+                        style = MaterialTheme.typography.titleLarge,
+                        modifier = Modifier.weight(1f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = Money.withCode(
+                            debts.sumOf { it.amountMinor },
+                            trip.homeCurrency
+                        ),
+                        style = MaterialTheme.typography.titleLarge,
+                        color = MoneyOwed
+                    )
                 }
+                Text(
+                    text = "in " + debts.size +
+                        (if (debts.size == 1) " payment" else " separate payments"),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MoneySlate
+                )
+                Spacer(Modifier.height(4.dp))
+                debts.forEach { d -> DebtCard(trip, d, onRecordPayment) }
             }
         }
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(20.dp))
         TextButton(onClick = { onRecordPayment(null, null, null) }) {
             Text("Record a different payment")
         }
         Spacer(Modifier.height(28.dp))
+    }
+}
+
+/**
+ * One payable line, with the working behind it available on a tap. Seeing that a
+ * figure is "hotel 100.00 less your taxi 40.00" is what stops an argument.
+ */
+@Composable
+private fun DebtCard(
+    trip: Trip,
+    debt: PairDebt,
+    onRecordPayment: (String?, String?, Long?) -> Unit
+) {
+    var showWorking by remember { mutableStateOf(false) }
+
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(top = 10.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = "→  " + trip.nameOf(debt.toId),
+                style = MaterialTheme.typography.bodyLarge,
+                modifier = Modifier.weight(1f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = Money.format(debt.amountMinor),
+                style = MaterialTheme.typography.titleMedium,
+                color = MoneyGold
+            )
+        }
+        Spacer(Modifier.height(6.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedButton(
+                onClick = { onRecordPayment(debt.fromId, debt.toId, debt.amountMinor) }
+            ) {
+                Text("Mark paid")
+            }
+            Spacer(Modifier.width(10.dp))
+            TextButton(onClick = { showWorking = !showWorking }) {
+                Text(if (showWorking) "Hide working" else "Why this much")
+            }
+        }
+        if (showWorking) {
+            Spacer(Modifier.height(2.dp))
+            debt.lines.forEach { line ->
+                Row(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+                    Text(
+                        text = line.label,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MoneySlate,
+                        modifier = Modifier.weight(1f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = (if (line.amountMinor > 0L) "+" else "") +
+                            Money.format(line.amountMinor),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (line.amountMinor > 0L) MoneySlate else MoneyGold
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        HorizontalDivider(color = MaterialTheme.colorScheme.outline)
     }
 }
 

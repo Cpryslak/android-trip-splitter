@@ -71,7 +71,7 @@ data class Trip(
 
     /** How many payments are still outstanding on this trip. */
     val outstandingCount: Int
-        get() = Settle.transfers(Settle.balances(this)).size
+        get() = Settle.pairDebts(this).size
 }
 
 /**

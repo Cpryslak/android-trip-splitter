@@ -20,7 +20,16 @@ with the ledger beside the balances.
 - Records repayments. When someone actually hands over the money, **Mark paid**
   on that settle-up line logs it, prefilled with the exact figure. Their balance
   clears; everyone else's is untouched. Partial repayments work too — enter a
-  smaller amount and the remainder stays outstanding.
+  smaller amount and the remainder stays outstanding. The add button offers
+  either an expense or a repayment.
+- **Settle-up is pairwise, grouped by who owes.** Each line counts only the
+  expenses those two people actually shared, plus repayments between the two of
+  them, so nobody is ever told to pay someone they never transacted with. Every
+  line has its own *Mark paid* and its own working — tap *Why this much* to see
+  the expenses behind the figure.
+- **A page per person.** Tap a name in the balances list for their whole
+  position: how the net figure is built, who it's with, everything they paid
+  for, everything they owe a share of, and every repayment.
 - Repayments sit in the same ledger as expenses but are never split, and never
   count as trip spending.
 - Sends the settle-up to the group chat as plain text.
@@ -107,6 +116,19 @@ typing.
 
 Losing the tablet is the real risk, and only an off-device copy helps. Send
 yourself a backup at the start and after any big day of spending.
+
+## Why not the fewest possible payments
+
+An earlier version minimised the *number* of payments by netting everyone
+against everyone. That is mathematically tidy and confusing in practice: it will
+tell Mike to pay Tanner because of a chain through two other people, even when
+Mike and Tanner never shared an expense.
+
+Pairwise settlement gives up on the minimum — a group of six can end up with
+more lines than strictly necessary — in exchange for every line being one both
+people can verify themselves. The totals are identical either way; a person's
+pair debts always sum to exactly the net shown above them, which the test suite
+asserts across 3,000 randomised trips so the two screens can never disagree.
 
 ## One rule about names
 
