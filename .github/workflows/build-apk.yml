@@ -4,6 +4,15 @@ on:
   push:
   workflow_dispatch:
 
+env:
+  # Set these three repository secrets once (see README, "Signing") and every
+  # build is signed with the same key, so new APKs install straight over old
+  # ones. Without them each build gets a throwaway key and updating means
+  # uninstalling, which deletes the trips on the tablet.
+  TRIPSPLIT_KEYSTORE_BASE64: ${{ secrets.TRIPSPLIT_KEYSTORE_BASE64 }}
+  TRIPSPLIT_KEYSTORE_PASSWORD: ${{ secrets.TRIPSPLIT_KEYSTORE_PASSWORD }}
+  TRIPSPLIT_KEY_ALIAS: ${{ secrets.TRIPSPLIT_KEY_ALIAS }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -24,9 +33,19 @@ jobs:
       - name: Make sure the SDK pieces we need are present
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" > /dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" > /dev/null 2>&1 || true
 
-      - name: Run the money tests
+      - name: Unpack the signing key
+        run: |
+          if [ -n "$TRIPSPLIT_KEYSTORE_BASE64" ]; then
+            echo "$TRIPSPLIT_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/tripsplit.keystore"
+            echo "TRIPSPLIT_KEYSTORE_PATH=$RUNNER_TEMP/tripsplit.keystore" >> "$GITHUB_ENV"
+            echo "Signing with the shared key."
+          else
+            echo "::warning title=No signing key::TRIPSPLIT_KEYSTORE_BASE64 is not set, so this APK has a throwaway signature. Installing it over an earlier build will fail until the old copy is uninstalled, which deletes its data. Run the 'Create signing key' workflow once and add the secrets it describes."
+          fi
+
+      - name: Run the tests
         run: gradle test --no-daemon --stacktrace
 
       - name: Build the debug APK

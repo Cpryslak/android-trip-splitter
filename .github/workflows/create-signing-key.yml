@@ -1,0 +1,52 @@
+name: Create signing key
+
+# Run this once, by hand, from the Actions tab. It makes a keystore and uploads
+# it as an artifact together with the secrets to paste into the repository
+# settings. After that every APK the build workflow produces installs over the
+# previous one without losing any data. Keep the download somewhere safe; if it
+# is lost, the next build's APK will again refuse to install over the old one.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  make-key:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Generate the keystore
+        run: |
+          set -e
+          PASSWORD="$(openssl rand -hex 16)"
+          keytool -genkeypair -v \
+            -keystore tripsplit.keystore \
+            -alias tripsplit \
+            -keyalg RSA -keysize 2048 -validity 36500 \
+            -storepass "$PASSWORD" -keypass "$PASSWORD" \
+            -dname "CN=Trip Split, OU=Personal, O=Trip Split, L=Home, S=Home, C=US"
+          mkdir -p out
+          cp tripsplit.keystore out/
+          base64 -w0 tripsplit.keystore > out/TRIPSPLIT_KEYSTORE_BASE64.txt
+          {
+            echo "Add these three secrets under Settings > Secrets and variables > Actions:"
+            echo
+            echo "  TRIPSPLIT_KEYSTORE_BASE64   = the whole contents of TRIPSPLIT_KEYSTORE_BASE64.txt"
+            echo "  TRIPSPLIT_KEYSTORE_PASSWORD = $PASSWORD"
+            echo "  TRIPSPLIT_KEY_ALIAS         = tripsplit"
+            echo
+            echo "Then run the Build APK workflow. Every APK from then on installs over the last."
+            echo "Keep this folder somewhere safe and delete this workflow run afterwards,"
+            echo "since anyone who can read the repository can download its artifacts."
+          } > out/README.txt
+
+      - name: Upload the key and instructions
+        uses: actions/upload-artifact@v6
+        with:
+          name: trip-split-signing-key
+          path: out/
+          retention-days: 7

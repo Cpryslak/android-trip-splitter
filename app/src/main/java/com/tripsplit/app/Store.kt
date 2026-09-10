@@ -1,22 +1,30 @@
 package com.tripsplit.app
 
 import android.content.Context
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.UUID
 
 /**
  * Every trip lives in one small JSON file in the app's private storage. No
  * database, no network, nothing to sync — it works in airplane mode.
  *
- * Schema 3 holds a library of trips. Files written by schema 1 and 2 held a
- * single trip and still load: they become the first trip in the library.
+ * Schema 4 holds a library of trips; expenses may carry a category and split
+ * weights. Schema 3 files (no category, equal splits) load unchanged. Files
+ * written by schema 1 and 2 held a single trip and still load: they become the
+ * first trip in the library.
  */
 object Store {
 
+    private const val TAG = "TripSplit.Store"
     private const val FILE_NAME = "trips.json"
     private const val LEGACY_FILE_NAME = "trip.json"
+    const val SCHEMA = 4
 
     private fun file(ctx: Context) = File(ctx.filesDir, FILE_NAME)
 
@@ -38,6 +46,7 @@ object Store {
             if (source === legacy) save(ctx, library)
             library
         } catch (e: Exception) {
+            Log.e(TAG, "Ledger file didn't parse; keeping a copy as trips.corrupt.json", e)
             try {
                 source.copyTo(File(ctx.filesDir, "trips.corrupt.json"), overwrite = true)
             } catch (_: Exception) {}
@@ -45,23 +54,60 @@ object Store {
         }
     }
 
-    fun save(ctx: Context, library: Library) {
-        try {
-            val tmp = File(ctx.filesDir, "$FILE_NAME.tmp")
-            tmp.writeText(libraryToJson(library).toString())
-            // write-then-rename, so a crash mid-save can't leave a half file
-            tmp.renameTo(file(ctx))
-        } catch (_: Exception) {
+    /**
+     * Write-then-rename with an fsync in between, so a crash mid-save can't
+     * leave a half file. Returns false if the change did NOT reach disk, so the
+     * screen can say so instead of quietly showing data that isn't saved.
+     */
+    fun save(ctx: Context, library: Library): Boolean {
+        val text = libraryToJson(library).toString()
+        val target = file(ctx)
+        val tmp = File(ctx.filesDir, "$FILE_NAME.tmp")
+        return try {
+            FileOutputStream(tmp).use { out ->
+                out.write(text.toByteArray(Charsets.UTF_8))
+                out.flush()
+                out.fd.sync()
+            }
+            moveIntoPlace(tmp, target, text)
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Couldn't save the ledger", e)
+            false
         }
+    }
+
+    private fun moveIntoPlace(tmp: File, target: File, text: String) {
+        try {
+            Files.move(
+                tmp.toPath(), target.toPath(),
+                StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE
+            )
+            return
+        } catch (e: Exception) {
+            Log.w(TAG, "Atomic move failed, trying a plain rename", e)
+        }
+        if (tmp.renameTo(target)) return
+        // Last resort: straight into place. Not atomic, but far better than
+        // reporting success for a change that never landed.
+        target.writeText(text)
+        tmp.delete()
     }
 
     /** Pretty JSON, for a backup a human can actually read. */
     fun toJsonText(library: Library): String = libraryToJson(library).toString(2)
 
-    /** Null when the text isn't a trip file, so a bad import can't wipe anything. */
+    /**
+     * Null when the text isn't a trip file, so a bad import can't wipe anything.
+     * A bare "{}" would otherwise read as an empty old-style trip, so a library
+     * only counts if at least one trip has people or entries in it.
+     */
     fun fromJsonText(text: String): Library? = try {
         val library = libraryFromJson(JSONObject(text))
-        if (library.trips.isEmpty()) null else library
+        val real = library.trips.any {
+            it.people.isNotEmpty() || it.expenses.isNotEmpty() || it.payments.isNotEmpty()
+        }
+        if (real) library else null
     } catch (e: Exception) {
         null
     }
@@ -72,7 +118,7 @@ object Store {
         val trips = JSONArray()
         library.trips.forEach { trips.put(tripToJson(it)) }
         return JSONObject()
-            .put("version", 3)
+            .put("version", SCHEMA)
             .put("activeId", library.activeId)
             .put("trips", trips)
     }
@@ -95,6 +141,12 @@ object Store {
                 .put("createdAt", e.createdAt)
             if (e.localMinor != null) o.put("localMinor", e.localMinor)
             if (e.rateUsed != null) o.put("rateUsed", e.rateUsed)
+            if (e.category.isNotBlank()) o.put("category", e.category)
+            if (e.weights != null) {
+                val w = JSONObject()
+                e.weights.forEach { (id, weight) -> w.put(id, weight) }
+                o.put("weights", w)
+            }
             expenses.put(o)
         }
         val payments = JSONArray()
@@ -159,6 +211,16 @@ object Store {
             val sharedArr = e.optJSONArray("sharedBy") ?: JSONArray()
             val shared = ArrayList<String>()
             for (j in 0 until sharedArr.length()) shared.add(sharedArr.getString(j))
+            val weightsObj = e.optJSONObject("weights")
+            val weights: Map<String, Long>? = if (weightsObj == null) null else {
+                val m = LinkedHashMap<String, Long>()
+                val keys = weightsObj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    m[k] = weightsObj.optLong(k, 1L)
+                }
+                m
+            }
             expenses.add(
                 Expense(
                     id = e.getString("id"),
@@ -168,7 +230,9 @@ object Store {
                     homeMinor = e.optLong("homeMinor", 0L),
                     localMinor = if (e.has("localMinor")) e.optLong("localMinor") else null,
                     rateUsed = if (e.has("rateUsed")) e.optDouble("rateUsed") else null,
-                    createdAt = e.optLong("createdAt", 0L)
+                    createdAt = e.optLong("createdAt", 0L),
+                    category = e.optString("category", ""),
+                    weights = weights
                 )
             )
         }

@@ -7,9 +7,25 @@ data class Person(
 )
 
 /**
+ * The fixed set of expense categories. Fixed so totals mean the same thing
+ * across trips; "Other" is the catch-all and blank means not categorised.
+ */
+object Categories {
+    val all: List<String> = listOf(
+        "Food", "Drinks", "Lodging", "Transport", "Tickets", "Groceries", "Fuel", "Other"
+    )
+    const val UNCATEGORISED = "Uncategorised"
+}
+
+/**
  * One outlay. [homeMinor] is canonical and always in the trip's home currency;
  * when money was spent abroad we also keep what was actually typed and the rate
  * used at the time, so editing the rate later never silently rewrites the past.
+ *
+ * [weights] is how the cost divides between [sharedBy]. Null means equally.
+ * Otherwise each participant's share is proportional to their weight — small
+ * integers for "she had two, I had one", or exact cents for a hand-typed split
+ * (which is just weights that happen to add up to the total).
  */
 data class Expense(
     val id: String,
@@ -19,8 +35,17 @@ data class Expense(
     val homeMinor: Long,
     val localMinor: Long? = null,
     val rateUsed: Double? = null,
-    val createdAt: Long = 0L
-)
+    val createdAt: Long = 0L,
+    val category: String = "",
+    val weights: Map<String, Long>? = null
+) {
+    /** A participant's weight; anyone not listed counts as one share. */
+    fun weightOf(personId: String): Long = weights?.get(personId) ?: 1L
+
+    /** True when the participants don't all carry the same weight. */
+    val isUneven: Boolean
+        get() = weights != null && sharedBy.map { weightOf(it) }.distinct().size > 1
+}
 
 /**
  * Money handed directly from one person to another to square up — not a trip
@@ -71,7 +96,16 @@ data class Trip(
 
     /** How many payments are still outstanding on this trip. */
     val outstandingCount: Int
-        get() = Settle.transfers(Settle.balances(this)).size
+        get() = Settle.pairDebts(this).size
+
+    /** Earliest and latest dated entry, or null when nothing has a date. */
+    val firstEntryAt: Long?
+        get() = (expenses.map { it.createdAt } + payments.map { it.createdAt })
+            .filter { it > 0L }.minOrNull()
+
+    val lastEntryAt: Long?
+        get() = (expenses.map { it.createdAt } + payments.map { it.createdAt })
+            .filter { it > 0L }.maxOrNull()
 }
 
 /**
@@ -90,9 +124,15 @@ data class Library(
     val byNewest: List<Trip>
         get() = trips.sortedByDescending { it.createdAt }
 
+    fun tripOf(id: String): Trip? = trips.firstOrNull { it.id == id }
+
     /** Adds or replaces a trip by id, and opens it. */
     fun withTrip(trip: Trip): Library =
         copy(trips = trips.filterNot { it.id == trip.id } + trip, activeId = trip.id)
+
+    /** Adds or replaces a trip by id without changing which one is open. */
+    fun updated(trip: Trip): Library =
+        copy(trips = trips.filterNot { it.id == trip.id } + trip)
 
     fun without(tripId: String): Library {
         val remaining = trips.filterNot { it.id == tripId }

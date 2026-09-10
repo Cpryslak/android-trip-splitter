@@ -1,5 +1,8 @@
 package com.tripsplit.app
 
+import java.math.BigDecimal
+import java.math.RoundingMode
+
 /**
  * Everything is integer minor units (cents). Floating point is never allowed
  * near a running total — 0.1 + 0.2 problems become real money problems.
@@ -48,10 +51,34 @@ object Money {
         return (if (negative) "-" else "") + grouped + "." + cents
     }
 
+    /** 123456 -> "1234.56": no grouping, for spreadsheets and text fields. */
+    fun plain(minor: Long): String {
+        val negative = minor < 0
+        val abs = if (negative) -minor else minor
+        return (if (negative) "-" else "") + (abs / 100L) + "." + (abs % 100L).toString().padStart(2, '0')
+    }
+
     fun withCode(minor: Long, code: String): String =
         if (code.isBlank()) format(minor) else format(minor) + " " + code
 
     /** Converts a local-currency amount into home-currency minor units. */
     fun convert(localMinor: Long, rate: Double): Long =
         Math.round(localMinor.toDouble() * rate)
+
+    /**
+     * A rate the way a person would write it: "0.0107", never "1.07E-2", and
+     * never a tail of floating-point noise. Six decimals is plenty for any
+     * exchange rate anyone types by hand.
+     */
+    fun formatRate(rate: Double): String {
+        if (rate.isNaN() || rate.isInfinite()) return "1"
+        return BigDecimal(rate)
+            .setScale(6, RoundingMode.HALF_UP)
+            .stripTrailingZeros()
+            .toPlainString()
+    }
+
+    /** "0,0107" and "0.0107" both read as a rate. Null when it isn't one. */
+    fun parseRate(text: String): Double? =
+        text.trim().replace(",", ".").toDoubleOrNull()?.takeIf { it > 0.0 && it.isFinite() }
 }
